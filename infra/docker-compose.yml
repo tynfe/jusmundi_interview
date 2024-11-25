@@ -1,0 +1,282 @@
+services:
+
+  trino:
+    hostname: trino
+    container_name: trino
+    image: trinodb/trino:443
+    ports:
+      - 8090:8080
+    volumes:
+      - ./trinodb/conf:/etc/trino:ro
+    environment:
+      AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+      AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.170
+
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    expose:
+      - "2181"
+    volumes:
+      - kafka_zookeeper:/opt/zookeeper-3.4.13/data
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.11
+
+  kafka1:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka1
+    ports:
+      - "9093:9093"
+      - "29093:29093"
+      - "8081:8081"
+    environment:
+#      JMX_PORT: '8081'
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:19092,EXTERNAL://172.25.0.12:9093,DOCKER://host.docker.internal:29093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_BROKER_ID: 1
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.12
+    depends_on:
+      - zookeeper
+
+  kafka2:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka2
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+      - "8082:8082"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:19092,EXTERNAL://172.25.0.13:9092,DOCKER://host.docker.internal:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_BROKER_ID: 2
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.13
+    depends_on:
+      - zookeeper
+
+  kafka_manager:
+    image: hlebalbau/kafka-manager:stable
+    container_name: kakfa-manager
+    restart: always
+    ports:
+      - "9000:9000"
+    expose:
+      - "9000"
+    depends_on:
+      - zookeeper
+      - kafka1
+      - kafka2
+    environment:
+      ZK_HOSTS: "172.25.0.11:2181"
+      APPLICATION_SECRET: "random-secret"
+      command: -Dpidfile.path=/dev/null
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.14
+
+  telegraf:
+    image: telegraf:latest
+    restart: always
+    container_name: telegraf
+    hostname: telegraf
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.20
+    volumes:
+      - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf
+    ports:
+      - "9273:9273"
+    command: telegraf --config /etc/telegraf/telegraf.conf
+
+  prometheus:
+    image: prom/prometheus:v2.8.1
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    expose:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/flink.rules.yml:/etc/prometheus/flink.rules.yml
+    depends_on:
+      - "zookeeper"
+      - "kafka1"
+      - "kafka2"
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.15
+
+  grafana:
+    image: grafana/grafana:6.1.1
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=password
+    volumes:
+      - ./grafana/provisioning/:/etc/grafana/provisioning/
+    depends_on:
+      - "prometheus"
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.16
+
+  mariadb:
+    hostname: mariadb
+    container_name: mariadb
+    image: mariadb:10.5.8
+    ports:
+      - 3306:3306 # MariaDB for Hive Meta Store (HMS)
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_USER: tyron
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+      MYSQL_DATABASE: metastore_db
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.26
+
+  hive-metastore:
+      build: ./metastore
+      hostname: hive-metastore
+      container_name: hive-metastore
+      image: hive-metastore:3.1.3
+      ports:
+        - "9083:9083"
+        - "10000:10000"
+      volumes:
+        - spark-warehouse-data:/spark-warehouse
+        - ./metastore/conf/metastore-site.xml:/opt/apache-hive-metastore-3.1.3-bin/conf/metastore-site.xml:ro #rewriting HMS defaults
+
+      environment:
+        - AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+        - AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+        - METASTORE_DB_HOSTNAME=mariadb
+        - METASTORE_TYPE=mysql
+      depends_on:
+        - mariadb
+      networks:
+        - kafkanet
+
+  spark:
+    build: spark/
+    container_name: commons
+    environment:
+      - SPARK_MODE=master
+      - SPARK_WORKLOAD=master
+      - SPARK_LOCAL_IP=commons
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+      - AWS_REGION='eu-west-1'
+    ports:
+      - '8080:8080'
+      - "10001:10001"
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.17
+    volumes:
+      - ./spark/spark-default.conf:/opt/spark/conf/spark-default.conf
+      - ./../src:/opt/spark/elt/src
+      - ./../pyproject.toml:/opt/spark/elt/pyproject.toml
+      - ./../README.md:/opt/spark/elt/README.md
+      - spark-common-python:/opt/spark/elt/deps
+      - spark-warehouse-data:/home/iceberg/warehouse
+
+  spark-worker-1:
+   build: spark/
+   container_name: commons-worker-1
+   ports:
+     - "4040:4040"
+   expose:
+    - "4040"
+   environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER=spark://commons:7077
+      - SPARK_WORKLOAD=worker
+      - SPARK_MASTER_URL=spark://commons:7077
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_WORKER_CORES=3
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+   depends_on:
+     - spark
+   volumes:
+     - spark-warehouse-data:/home/iceberg/warehouse
+     - spark-common-python:/opt/spark/elt/deps
+   networks:
+     kafkanet:
+       ipv4_address: 172.25.0.18
+
+  spark-worker-2:
+    build: spark
+    container_name: commons-worker-2
+    expose:
+      - "4040"
+    ports:
+      - '4041:4040'
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER=spark://commons:7077
+      - SPARK_WORKLOAD=worker
+      - SPARK_MASTER_URL=spark://commons:7077
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_WORKER_CORES=3
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    depends_on:
+      - spark
+    volumes:
+      - spark-warehouse-data:/home/iceberg/warehouse
+      - spark-common-python:/opt/spark/elt/deps
+    networks:
+      kafkanet:
+        ipv4_address: 172.25.0.19
+
+networks:
+  kafkanet:
+    name: kafkanet
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.25.0.0/16
+          gateway: 172.25.0.1
+
+volumes:
+  spark-common-python:
+  spark-warehouse-data:
+    driver: local
+  mariadb-data:
+  kafka_zookeeper:
+  kafka_kafka1:
+  kafka_kafka2:
+
